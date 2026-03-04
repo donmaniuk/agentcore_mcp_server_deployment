@@ -1062,9 +1062,16 @@ def push_ecr(ctx: DeploymentContext) -> None:
     )
     ecr_host = f"{ctx.account_id}.dkr.ecr.{ctx.region}.amazonaws.com"
 
-    # Write credentials directly to finch config.json (osxkeychain is inaccessible from Lima VM)
+    # Write credentials directly to finch/docker config.json
+    # On Linux, finch (nerdctl) reads from ~/.docker/config.json
+    # On macOS, finch reads from ~/.finch/config.json
     import base64 as _base64
-    finch_config_path = Path.home() / ".finch" / "config.json"
+    import platform as _platform_mod
+    if _platform_mod.system().lower() == "linux":
+        finch_config_path = Path.home() / ".docker" / "config.json"
+    else:
+        finch_config_path = Path.home() / ".finch" / "config.json"
+    finch_config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         finch_cfg = _json_mod.loads(finch_config_path.read_text()) if finch_config_path.exists() else {}
     except Exception:
@@ -1073,7 +1080,7 @@ def push_ecr(ctx: DeploymentContext) -> None:
         "auth": _base64.b64encode(f"AWS:{token_result.stdout.strip()}".encode()).decode()
     }
     finch_config_path.write_text(_json_mod.dumps(finch_cfg, indent="\t"))
-    log.info("ECR credentials written to finch config for %s", ecr_host)
+    log.info("ECR credentials written to %s for %s", finch_config_path, ecr_host)
 
     # Tag and push
     run_cmd(_finch("tag", ctx.image_tag, ecr_uri), stage="ECR")
