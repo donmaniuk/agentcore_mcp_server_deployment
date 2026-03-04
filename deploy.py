@@ -79,6 +79,7 @@ class DeploymentContext:
     server_name: str | None = None
     region: str = ""
     verbose: bool = False
+    gateway_arg: str | None = None  # --gateway CLI arg: gateway ID or "new"
 
     @property
     def safe_name(self) -> str:
@@ -167,6 +168,11 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Enable DEBUG logging.",
+    )
+    parser.add_argument(
+        "--gateway",
+        help="Gateway ID to reuse, or 'new' to always create new infrastructure. Skips interactive prompt.",
+        default=None,
     )
     return parser.parse_args()
 
@@ -1212,6 +1218,25 @@ def detect_infrastructure(ctx: DeploymentContext) -> None:
         ctx.reuse_existing = False
         return
 
+    # Non-interactive mode: --gateway new or --gateway <id>
+    if ctx.gateway_arg:
+        if ctx.gateway_arg.lower() == "new":
+            ctx.reuse_existing = False
+            log.info("--gateway new: Creating new infrastructure.")
+            return
+        # Try to match by ID or name
+        for gw in gateways:
+            if gw["gatewayId"] == ctx.gateway_arg or gw.get("name") == ctx.gateway_arg:
+                ctx.reuse_existing = True
+                ctx.existing_gateway_id = gw["gatewayId"]
+                ctx.existing_gateway_name = gw.get("name", "")
+                log.info("--gateway: Reusing Gateway %s (%s)", ctx.existing_gateway_name, ctx.existing_gateway_id)
+                _retrieve_reuse_details(ctx, ac, log)
+                return
+        log.warning("--gateway %s not found; creating new infrastructure.", ctx.gateway_arg)
+        ctx.reuse_existing = False
+        return
+
     print("\nExisting AgentCore Gateways:")
     for i, gw in enumerate(gateways, 1):
         print(f"  [{i}] {gw.get('name', 'unnamed')} ({gw['gatewayId']})")
@@ -1869,6 +1894,7 @@ def main() -> None:
         server_name=server_name,
         region=region,
         verbose=args.verbose,
+        gateway_arg=args.gateway,
     )
     run_pipeline(ctx)
 
