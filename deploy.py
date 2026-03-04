@@ -1638,8 +1638,8 @@ def create_oauth_provider(ctx: DeploymentContext) -> None:
         log.info("OAuth provider created: %s", ctx.oauth_provider_arn)
         import time as _time_oauth_wait
         _time_oauth_wait.sleep(10)  # Allow Secrets Manager secret to propagate
-    except ac.exceptions.ValidationException as exc:
-        if "already exists" in str(exc):
+    except Exception as exc:
+        if "already exists" in str(exc) or "ConflictException" in type(exc).__name__:
             providers = ac.list_oauth2_credential_providers().get("credentialProviders", [])
             existing = next((p for p in providers if p.get("name") == f"{ctx.hyphen_name}-oauth-provider"), None)
             if existing is None:
