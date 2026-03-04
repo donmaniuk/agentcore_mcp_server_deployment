@@ -306,6 +306,12 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, check: bool = True, stage: 
     return result
 
 
+def _finch(*args: str) -> list[str]:
+    """Return a finch command prefixed with sudo on Linux (containerd requires root)."""
+    prefix = ["sudo"] if _platform.system().lower() == "linux" else []
+    return prefix + ["finch", *args]
+
+
 def github_api_get(path: str, stage: str = "CATALOG") -> Any:
     """Fetch JSON from the GitHub API with rate-limit handling."""
     url = f"https://api.github.com/repos/awslabs/mcp/contents/{path}"
@@ -924,7 +930,7 @@ def build_container(ctx: DeploymentContext) -> None:
     ctx.image_tag = image_tag
     log.info("Building container image %s...", image_tag)
     run_cmd(
-        ["finch", "build", "--platform", "linux/arm64", "-t", image_tag, "."],
+        _finch("build", "--platform", "linux/arm64", "-t", image_tag, "."),
         cwd=ctx.server_dir,
         stage="BUILD",
     )
@@ -946,9 +952,9 @@ def verify_container(ctx: DeploymentContext) -> None:
 
     log.info("Starting container %s on port %d for local verification...", ctx.image_tag, port)
     result = run_cmd(
-        ["finch", "run", "-d", "-p", f"{port}:8080",
-         "-e", "MCP_TRANSPORT=streamable-http",
-         ctx.image_tag],
+        _finch("run", "-d", "-p", f"{port}:8080",
+               "-e", "MCP_TRANSPORT=streamable-http",
+               ctx.image_tag),
         stage="VERIFY",
     )
     container_id = result.stdout.strip()
@@ -1012,12 +1018,12 @@ def verify_container(ctx: DeploymentContext) -> None:
     finally:
         if container_id:
             log.info("Stopping and removing test container %s...", container_id[:12])
-            run_cmd(["finch", "stop", container_id], check=False, stage="VERIFY")
-            run_cmd(["finch", "rm", container_id], check=False, stage="VERIFY")
+            run_cmd(_finch("stop", container_id), check=False, stage="VERIFY")
+            run_cmd(_finch("rm", container_id), check=False, stage="VERIFY")
 
 
 def _dump_container_logs(container_id: str, log: Any) -> None:
-    result = run_cmd(["finch", "logs", container_id], check=False, stage="VERIFY")
+    result = run_cmd(_finch("logs", container_id), check=False, stage="VERIFY")
     log.error("Container logs:\n%s", result.stdout + result.stderr)
 
 
@@ -1070,9 +1076,9 @@ def push_ecr(ctx: DeploymentContext) -> None:
     log.info("ECR credentials written to finch config for %s", ecr_host)
 
     # Tag and push
-    run_cmd(["finch", "tag", ctx.image_tag, ecr_uri], stage="ECR")
+    run_cmd(_finch("tag", ctx.image_tag, ecr_uri), stage="ECR")
     log.info("Pushing image to ECR...")
-    run_cmd(["finch", "push", ecr_uri], stage="ECR")
+    run_cmd(_finch("push", ecr_uri), stage="ECR")
     log.info("Image pushed successfully: %s", ecr_uri)
 
 
