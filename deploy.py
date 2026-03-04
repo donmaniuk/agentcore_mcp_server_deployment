@@ -80,6 +80,7 @@ class DeploymentContext:
     region: str = ""
     verbose: bool = False
     gateway_arg: str | None = None  # --gateway CLI arg: gateway ID or "new"
+    repo_dir_arg: str | None = None  # --repo-dir CLI arg: path to existing mcp clone
 
     @property
     def safe_name(self) -> str:
@@ -172,6 +173,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gateway",
         help="Gateway ID to reuse, or 'new' to always create new infrastructure. Skips interactive prompt.",
+        default=None,
+    )
+    parser.add_argument(
+        "--repo-dir",
+        help="Path to an existing awslabs/mcp clone. Skips git clone (useful when GitHub is rate-limited).",
         default=None,
     )
     return parser.parse_args()
@@ -402,6 +408,27 @@ def get_aws_account_id(region: str) -> str:
 def fetch_catalog(ctx: DeploymentContext) -> None:
     """Fetch the list of MCP servers from GitHub and build the catalog."""
     log = StageLogger(logging.getLogger(__name__), {"stage": "CATALOG"})
+
+    # If --repo-dir provided, use it directly without cloning
+    if ctx.repo_dir_arg:
+        repo_dir = Path(ctx.repo_dir_arg)
+        src_dir = repo_dir / "src"
+        ctx.repo_dir = repo_dir
+        catalog = []
+        for server_dir in sorted(src_dir.iterdir()):
+            if not server_dir.is_dir():
+                continue
+            dir_name = server_dir.name
+            display_name = _extract_display_name_from_local(server_dir, dir_name)
+            catalog.append((dir_name, display_name))
+        catalog.sort(key=lambda x: x[1])
+        ctx.catalog = [
+            CatalogEntry(index=i + 1, directory_name=dn, display_name=disp, path=src_dir / dn)
+            for i, (dn, disp) in enumerate(catalog)
+        ]
+        log.info("Found %d MCP servers (from --repo-dir).", len(ctx.catalog))
+        return
+
     log.info("Fetching MCP server catalog from GitHub...")
 
     try:
@@ -568,6 +595,14 @@ def select_server(ctx: DeploymentContext) -> None:
 def sparse_download(ctx: DeploymentContext) -> None:
     """Download only the selected server's directory using git sparse-checkout."""
     log = StageLogger(logging.getLogger(__name__), {"stage": "CLONE"})
+
+    # If --repo-dir was provided, the full repo is already available
+    if ctx.repo_dir_arg:
+        ctx.server_dir = ctx.repo_dir / "src" / ctx.server_name
+        if not ctx.server_dir.exists():
+            raise DeploymentError("CLONE", f"Server directory not found in --repo-dir: {ctx.server_dir}")
+        log.info("Server directory ready: %s", ctx.server_dir)
+        return
 
     # If we already have a full clone from the fallback, just use it
     if ctx.repo_dir and (ctx.repo_dir / ".git").exists():
@@ -874,6 +909,11 @@ def install_finch(ctx: DeploymentContext) -> None:
                 run_cmd(["finch", "vm", "start"], check=False, stage="FINCH")
         else:
             log.info("Finch is already installed (Linux — no VM required).")
+            # Ensure finch-buildkit service is running (required for finch build)
+            run_cmd(["sudo", "systemctl", "start", "finch-buildkit.service", "finch.service"],
+                    check=False, stage="FINCH")
+            import time as _time_finch
+            _time_finch.sleep(3)  # Allow buildkitd to start
         return
 
     system = _platform.system().lower()
@@ -1366,12 +1406,20 @@ def setup_cognito(ctx: DeploymentContext) -> None:
         ctx.oauth_provider_client_id = initial_client["UserPoolClient"]["ClientId"]
         log.info("Created initial App Client: %s", ctx.oauth_provider_client_id)
     elif ctx.cognito_pool_id and not ctx.oauth_provider_client_id:
-        # Reusing existing pool — find the initial client from the previous deployment JSON
-        prev_file = Path(f"{ctx.server_name}-deployment.json")
-        if prev_file.exists():
-            prev = _json_mod.loads(prev_file.read_text())
-            # Use the previous client_id as the oauth_provider_client_id placeholder
-            ctx.oauth_provider_client_id = prev.get("client_id", "")
+        # Reusing existing pool — find the initial client from Cognito directly
+        try:
+            all_clients = cognito.list_user_pool_clients(
+                UserPoolId=ctx.cognito_pool_id, MaxResults=60
+            ).get("UserPoolClients", [])
+            initial = next(
+                (c for c in all_clients if c.get("ClientName") == "mcp-gateway-initial-client"),
+                None,
+            )
+            if initial:
+                ctx.oauth_provider_client_id = initial["ClientId"]
+                log.info("Found existing initial App Client: %s", ctx.oauth_provider_client_id)
+        except Exception as exc:
+            log.warning("Could not look up initial App Client: %s", exc)
 
     # Always create a server-specific App Client
     server_client = cognito.create_user_pool_client(
@@ -1593,24 +1641,31 @@ def create_oauth_provider(ctx: DeploymentContext) -> None:
     """Create an OAuth2 credential provider in AgentCore Token Vault. Skip if reusing."""
     log = StageLogger(logging.getLogger(__name__), {"stage": "OAUTH"})
 
-    if ctx.reuse_existing:
-        if not ctx.oauth_provider_arn:
-            # Look up the existing OAuth provider for this server
-            ac = boto3.client("bedrock-agentcore-control", region_name=ctx.region)
-            providers = ac.list_oauth2_credential_providers().get("credentialProviders", [])
-            existing = next((p for p in providers if p.get("name") == f"{ctx.hyphen_name}-oauth-provider"), None)
-            if existing:
-                ctx.oauth_provider_arn = existing["credentialProviderArn"]
-                log.info("Found existing OAuth provider: %s", ctx.oauth_provider_arn)
-            else:
-                log.info("No existing OAuth provider found, will create one.")
-                ctx.reuse_existing = False  # fall through to create
-        else:
-            log.info("Reusing existing OAuth provider: %s", ctx.oauth_provider_arn)
-        if ctx.reuse_existing:
+    ac = boto3.client("bedrock-agentcore-control", region_name=ctx.region)
+
+    # Always check if provider already exists before attempting creation
+    if not ctx.oauth_provider_arn:
+        # Handle pagination
+        existing = None
+        kwargs: dict = {}
+        while True:
+            resp = ac.list_oauth2_credential_providers(**kwargs)
+            for p in resp.get("credentialProviders", []):
+                if p.get("name") == f"{ctx.hyphen_name}-oauth-provider":
+                    existing = p
+                    break
+            if existing or not resp.get("nextToken"):
+                break
+            kwargs["nextToken"] = resp["nextToken"]
+        if existing:
+            ctx.oauth_provider_arn = existing["credentialProviderArn"]
+            log.info("Found existing OAuth provider: %s", ctx.oauth_provider_arn)
             return
 
-    ac = boto3.client("bedrock-agentcore-control", region_name=ctx.region)
+    if ctx.oauth_provider_arn:
+        log.info("Reusing existing OAuth provider: %s", ctx.oauth_provider_arn)
+        return
+
     token_url = f"https://{ctx.cognito_domain}.auth.{ctx.region}.amazoncognito.com/oauth2/token"
     auth_url = f"https://{ctx.cognito_domain}.auth.{ctx.region}.amazoncognito.com/oauth2/authorize"
     issuer_url = f"https://cognito-idp.{ctx.region}.amazonaws.com/{ctx.cognito_pool_id}"
@@ -1895,6 +1950,7 @@ def main() -> None:
         region=region,
         verbose=args.verbose,
         gateway_arg=args.gateway,
+        repo_dir_arg=args.repo_dir,
     )
     run_pipeline(ctx)
 
